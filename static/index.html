@@ -30,6 +30,7 @@
       <button id="btnPreview">▶ 运行预览</button>
       <button id="btnCoverage" title="按已保存运行记录统计各选项被选择次数">📊 分支覆盖</button>
       <button id="btnShare">🔗 只读分享</button>
+      <button id="btnTransplant" title="从其他已保存脚本选择入口节点，把可达分支整体复制到当前画布">🔀 跨脚本移植</button>
       <button id="btnExport">导出 JSON</button>
       <button id="btnImport">导入 JSON</button>
       <input type="file" id="importFile" accept="application/json,.json" hidden>
@@ -111,6 +112,34 @@
       <div style="margin-top:12px"><button class="primary" id="shareOpen">在新标签页打开</button></div>
     </div>
     <footer><button data-close="shareModal">关闭</button></footer>
+  </div>
+</div>
+
+<!-- transplant (cross-script branch port) modal -->
+<div class="modal-mask" id="transplantModal">
+  <div class="modal">
+    <header>🔀 跨脚本移植分支<span class="close" data-close="transplantModal">✕</span></header>
+    <div class="body">
+      <p class="form-hint">
+        从<b>当前脚本之外</b>的一份已保存脚本选择入口节点，将该节点可达的节点与选项连接一次性复制到当前画布。
+        节点与选项会重新生成 ID 并统一重写内部跳转；环路或多路径汇合的节点只复制一次；
+        原本无效 / 未连接的选项仍保持未连接。新分支按原相对坐标落在当前视野附近，
+        不覆盖源脚本，也不会改变当前脚本的起始节点；整次移植可一次撤销。
+      </p>
+      <div class="field">
+        <label>来源脚本</label>
+        <select id="transplantScript"></select>
+      </div>
+      <div class="field">
+        <label>入口节点（从该节点出发的可达分支将被复制）</label>
+        <select id="transplantEntry"></select>
+      </div>
+      <div class="tp-info" id="transplantInfo">请先选择来源脚本与入口节点。</div>
+    </div>
+    <footer>
+      <button data-close="transplantModal">取消</button>
+      <button class="primary" id="btnTransplantGo">复制到当前画布</button>
+    </footer>
   </div>
 </div>
 

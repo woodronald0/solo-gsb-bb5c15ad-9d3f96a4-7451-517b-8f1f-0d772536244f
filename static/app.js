@@ -716,9 +716,13 @@ function bindToolbar() {
   $("#btnPreview").onclick = openPreview;
   $("#btnCoverage").onclick = openCoverage;
   $("#btnShare").onclick = openShare;
+  $("#btnTransplant").onclick = openTransplant;
   $("#btnExport").onclick = exportJson;
   $("#btnImport").onclick = () => $("#importFile").click();
   $("#importFile").onchange = importJson;
+  $("#transplantScript").onchange = (e) => selectTransplantSource(e.target.value ? Number(e.target.value) : null);
+  $("#transplantEntry").onchange = renderTransplantInfo;
+  $("#btnTransplantGo").onclick = confirmTransplant;
   $("#btnAddNode").onclick = addNode;
   $("#btnUndo").onclick = undo;
   $("#btnRedo").onclick = redo;
@@ -810,6 +814,214 @@ async function importJson(e) {
     toast("导入失败：" + err.message, 3500);
   }
   e.target.value = "";
+}
+
+// ---------------------------------------------------------------- cross-script transplant
+// Ports the reachable sub-graph of a *different* saved script into the current
+// canvas in one shot: every node/option receives a fresh ID and internal
+// option targets are rewritten to the new node IDs. A visited-set traversal
+// guarantees cycles and reconverging diamond paths copy each node exactly
+// once; options that were unconnected or pointed at missing / out-of-reach
+// nodes in the source stay unconnected (target_id = null). The source script
+// is never modified and the current start node is left untouched; changed()
+// records the whole port as a single undo step and refreshes validation.
+
+const NODE_W = 230, NODE_H = 130;
+const transplantUi = { source: null };
+
+// BFS over valid internal edges only; the visited set makes cycle / merge
+// traversal terminate and deduplicates nodes.
+function transplantReachable(content, entryId) {
+  const map = new Map((content.nodes || []).map((n) => [n.id, n]));
+  const seen = new Set();
+  const q = [];
+  if (map.has(entryId)) { seen.add(entryId); q.push(entryId); }
+  while (q.length) {
+    const n = map.get(q.shift());
+    for (const o of n.options || []) {
+      const t = o.target_id;
+      if (t && map.has(t) && !seen.has(t)) { seen.add(t); q.push(t); }
+    }
+  }
+  return seen;
+}
+
+// Anchor for the copied entry node: inside the current viewport (screen
+// coords converted to world coords), so the branch appears "near the current
+// view" while source-relative coordinates are preserved for all other nodes.
+function transplantEntryXY() {
+  const rect = $("#canvasWrap").getBoundingClientRect();
+  return {
+    x: Math.round(rect.width * 0.3 - state.pan.x),
+    y: Math.round(rect.height * 0.45 - state.pan.y),
+  };
+}
+
+function buildTransplantNodes(srcContent, entryId, currentNodes, entryXY) {
+  const srcMap = new Map((srcContent.nodes || []).map((n) => [n.id, n]));
+  const reachable = transplantReachable(srcContent, entryId);
+
+  // Fresh IDs must be unique against everything already on the current canvas
+  // and against each other (added into the same "used" sets).
+  const usedNodeIds = new Set((currentNodes || []).map((n) => n.id));
+  const usedOptIds = new Set();
+  (currentNodes || []).forEach((n) => (n.options || []).forEach((o) => usedOptIds.add(o.id)));
+  const freshNodeId = () => {
+    let id = uid("n");
+    while (usedNodeIds.has(id)) id = uid("n");
+    usedNodeIds.add(id);
+    return id;
+  };
+  const freshOptId = () => {
+    let id = uid("o");
+    while (usedOptIds.has(id)) id = uid("o");
+    usedOptIds.add(id);
+    return id;
+  };
+
+  // One new node ID per reachable source node, allocated before cloning so
+  // internal target references can be resolved in any traversal order.
+  const nodeIdMap = new Map();
+  reachable.forEach((oldId) => nodeIdMap.set(oldId, freshNodeId()));
+
+  const source = srcMap.get(entryId);
+  let dx = entryXY.x - (source?.x || 0);
+  let dy = entryXY.y - (source?.y || 0);
+
+  // Keep the whole copied group inside the world bounds without changing its
+  // internal relative coordinates.
+  const b = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
+  reachable.forEach((oldId) => {
+    const n = srcMap.get(oldId);
+    b.minX = Math.min(b.minX, n.x || 0);
+    b.minY = Math.min(b.minY, n.y || 0);
+    b.maxX = Math.max(b.maxX, (n.x || 0) + NODE_W);
+    b.maxY = Math.max(b.maxY, (n.y || 0) + NODE_H);
+  });
+  dx = Math.min(Math.max(dx, -b.minX), Math.max(-b.minX, WORLD_W - b.maxX));
+  dy = Math.min(Math.max(dy, -b.minY), Math.max(-b.minY, WORLD_H - b.maxY));
+
+  const nodes = [];
+  reachable.forEach((oldId) => {
+    const n = srcMap.get(oldId);
+    nodes.push({
+      id: nodeIdMap.get(oldId),
+      type: n.type === "info" ? "info" : "question",
+      title: n.title || "",
+      text: n.text || "",
+      terminal: !!n.terminal,
+      x: (n.x || 0) + dx,
+      y: (n.y || 0) + dy,
+      options: (n.options || []).map((o) => {
+        const t = o.target_id;
+        // Internal reference (target also reachable): rewrite to the new ID.
+        // Empty, missing/invalid, or outside the copied subgraph: stay null.
+        const internal = !!(t && srcMap.has(t) && nodeIdMap.has(t));
+        return {
+          id: freshOptId(),
+          label: o.label || "",
+          target_id: internal ? nodeIdMap.get(t) : null,
+        };
+      }),
+    });
+  });
+
+  return { nodes, entryId: nodeIdMap.get(entryId), count: reachable.size };
+}
+
+async function openTransplant() {
+  if (!state.doc) return;
+  transplantUi.source = null;
+  const list = await api("/api/scripts");
+  state.scripts = list;
+  renderSidebar();
+
+  const sel = $("#transplantScript");
+  const others = list.filter((s) => s.id !== state.currentId);
+  sel.innerHTML = others.map((s) =>
+    `<option value="${s.id}">${esc(s.name)}</option>`).join("");
+  await selectTransplantSource(others.length ? others[0].id : null);
+  openModal("transplantModal");
+}
+
+async function selectTransplantSource(id) {
+  const entrySel = $("#transplantEntry");
+  const info = $("#transplantInfo");
+  const goBtn = $("#btnTransplantGo");
+  if (!id) {
+    transplantUi.source = null;
+    entrySel.innerHTML = "";
+    info.className = "tp-info warn";
+    info.textContent = "没有其他已保存脚本可作为来源；请先在左侧新建或从 JSON 导入一份脚本。";
+    goBtn.disabled = true;
+    return;
+  }
+  const s = await api(`/api/scripts/${Number(id)}`);
+  transplantUi.source = s;
+  const nodes = s.content?.nodes || [];
+  entrySel.innerHTML = nodes.map((n) =>
+    `<option value="${esc(n.id)}">${esc(n.title || n.id)}` +
+    `（${n.type === "info" ? "告知" : "问题"}${n.id === s.content?.start_node_id ? " · 起始" : ""}）</option>`
+  ).join("");
+  if (!nodes.length) {
+    info.className = "tp-info warn";
+    info.innerHTML = `来源脚本「<b>${esc(s.name)}</b>」没有任何节点，无法移植。`;
+    goBtn.disabled = true;
+    return;
+  }
+  // Default to the source's own start node when present.
+  if (s.content?.start_node_id && nodes.some((n) => n.id === s.content.start_node_id)) {
+    entrySel.value = s.content.start_node_id;
+  }
+  goBtn.disabled = false;
+  renderTransplantInfo();
+}
+
+function renderTransplantInfo() {
+  const s = transplantUi.source;
+  const info = $("#transplantInfo");
+  if (!s) return;
+  const entryId = $("#transplantEntry").value;
+  const reachable = transplantReachable(s.content, entryId);
+  const srcMap = new Map((s.content.nodes || []).map((n) => [n.id, n]));
+  let internalEdges = 0, leftOpen = 0;
+  reachable.forEach((id) => {
+    const n = srcMap.get(id);
+    for (const o of n.options || []) {
+      const t = o.target_id;
+      if (t && srcMap.has(t) && reachable.has(t)) internalEdges++;
+      else leftOpen++;
+    }
+  });
+  info.className = "tp-info";
+  info.innerHTML =
+    `将复制 <b>${reachable.size}</b> 个节点、<b>${internalEdges}</b> 条内部连接` +
+    (leftOpen ? `；<b>${leftOpen}</b> 个未连接 / 无效 / 指向复制范围外的选项仍保持未连接` : "") +
+    `。环路或多路径汇合的节点只复制一次；节点与选项全部重新生成 ID，` +
+    `当前起始节点不变，源脚本不受影响，整次移植可一次撤销。`;
+}
+
+async function confirmTransplant() {
+  const s = transplantUi.source;
+  if (!s || !state.doc) return;
+  const entryId = $("#transplantEntry").value;
+  if (!transplantReachable(s.content, entryId).size) {
+    toast("入口节点无效，无法移植", 3000);
+    return;
+  }
+  const built = buildTransplantNodes(
+    s.content, entryId, state.doc.content.nodes, transplantEntryXY());
+  state.doc.content.nodes.push(...built.nodes);
+  state.selectedNodeId = built.entryId;
+  state.selectedEdge = null;
+  closeModal("transplantModal");
+  // changed(): one pushHistory entry (single undo) and an immediate unsaved
+  // refresh; validateLocal() below makes the cycle/orphan/uncovered markers
+  // recompute synchronously (the debounced call in changed() then just
+  // recomputes the same result).
+  changed();
+  validateLocal();
+  toast(`已从「${s.name}」移植 ${built.count} 个节点到当前画布`);
 }
 
 // ---------------------------------------------------------------- share / preview
