@@ -23,6 +23,7 @@
     <div class="toolbar">
       <input class="title-input" id="scriptName" value="" placeholder="脚本名称">
       <button id="btnAddNode">＋ 添加问题节点</button>
+      <button id="btnPort" title="从其他已保存脚本复制入口可达的分支到当前画布">🔀 跨脚本移植</button>
       <button id="btnUndo" title="撤销 (Ctrl/Cmd+Z)" disabled>↶ 撤销</button>
       <button id="btnRedo" title="重做 (Shift+Ctrl/Cmd+Z)" disabled>↷ 重做</button>
       <button class="primary" id="btnSave">保存 (Ctrl+S)</button>
@@ -93,6 +94,32 @@
     <footer>
       <button id="coverageRefresh">↻ 刷新统计</button>
       <button data-close="coverageModal">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- cross-script port modal -->
+<div class="modal-mask" id="portModal">
+  <div class="modal">
+    <header>跨脚本移植分支<span class="close" data-close="portModal">✕</span></header>
+    <div class="body">
+      <p style="margin:0 0 12px;color:var(--muted);font-size:13px">
+        从<b>当前脚本以外</b>的已保存脚本选择入口节点，入口可达的全部节点与内部选项连接会被一次性复制到当前画布；
+        节点和选项会重新生成 ID，内部跳转引用统一重写，环路或多路径汇合也只复制一次，原本无效或未连接的目标保持未连接。
+        新分支按原相对坐标放在当前视野附近，不会覆盖当前起始节点，整次移植计为一次撤销。</p>
+      <div class="field">
+        <label for="portScript">来源脚本</label>
+        <select id="portScript"></select>
+      </div>
+      <div class="field">
+        <label for="portEntry">入口节点（从该节点出发复制可达分支）</label>
+        <select id="portEntry"></select>
+      </div>
+      <div class="port-summary" id="portSummary"></div>
+    </div>
+    <footer>
+      <button data-close="portModal">取消</button>
+      <button class="primary" id="portConfirm">移植到当前画布</button>
     </footer>
   </div>
 </div>

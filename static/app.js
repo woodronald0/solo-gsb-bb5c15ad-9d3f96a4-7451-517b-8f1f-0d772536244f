@@ -719,6 +719,10 @@ function bindToolbar() {
   $("#btnExport").onclick = exportJson;
   $("#btnImport").onclick = () => $("#importFile").click();
   $("#importFile").onchange = importJson;
+  $("#btnPort").onclick = openPort;
+  $("#portScript").onchange = onPortScriptChange;
+  $("#portEntry").onchange = updatePortSummary;
+  $("#portConfirm").onclick = confirmPort;
   $("#btnAddNode").onclick = addNode;
   $("#btnUndo").onclick = undo;
   $("#btnRedo").onclick = redo;
@@ -810,6 +814,194 @@ async function importJson(e) {
     toast("导入失败：" + err.message, 3500);
   }
   e.target.value = "";
+}
+
+// ---------------------------------------------------------------- cross-script porting
+// Copies the branch reachable from a chosen entry node of ANOTHER saved script
+// into the current canvas. Pure client-side: reuses GET /api/scripts and
+// GET /api/scripts/{id}, no extra endpoints. Every node/option gets a fresh
+// unique id and internal targets are rewritten in one pass; cycles and merging
+// paths are de-duplicated by a visited set (BFS); targets that were missing or
+// dangling (or point outside the copied subgraph) stay unconnected.
+
+const portState = { docs: new Map() };   // source script id -> fetched script
+
+// Nodes reachable from entryId, in first-visit BFS order; each node appears
+// exactly once even with cycles or several paths converging on it.
+function reachableSubgraph(content, entryId) {
+  const map = new Map((content.nodes || []).map((n) => [n.id, n]));
+  const seen = new Set([entryId]);
+  const order = [];
+  const queue = [entryId];
+  while (queue.length) {
+    const n = map.get(queue.shift());
+    if (!n) continue;
+    order.push(n);
+    for (const o of n.options || []) {
+      const t = o.target_id;
+      if (t && map.has(t) && !seen.has(t)) { seen.add(t); queue.push(t); }
+    }
+  }
+  return order;
+}
+
+function portSubgraphSummary(nodes) {
+  const ids = new Set(nodes.map((n) => n.id));
+  let internal = 0, dangling = 0;
+  nodes.forEach((n) => (n.options || []).forEach((o) => {
+    if (o.target_id && ids.has(o.target_id)) internal++;
+    else dangling++;
+  }));
+  return { nodes: nodes.length, internal, dangling };
+}
+
+async function openPort() {
+  if (!state.doc) return;
+  try {
+    state.scripts = await api("/api/scripts");
+  } catch (err) {
+    toast("脚本列表加载失败：" + err.message, 3000);
+    return;
+  }
+  portState.docs = new Map();
+  renderPortScriptOptions();
+  await onPortScriptChange();
+  openModal("portModal");
+}
+
+function renderPortScriptOptions() {
+  const sel = $("#portScript");
+  const others = state.scripts.filter((s) => s.id !== state.currentId);
+  if (!others.length) {
+    sel.innerHTML = `<option value="">（除当前脚本外没有已保存脚本，请先保存或新建其他脚本）</option>`;
+    sel.disabled = true;
+    $("#portEntry").innerHTML = "";
+    $("#portEntry").disabled = true;
+    $("#portSummary").innerHTML = "";
+    $("#portConfirm").disabled = true;
+    return;
+  }
+  sel.disabled = false;
+  $("#portConfirm").disabled = false;
+  sel.innerHTML = others.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join("");
+}
+
+async function onPortScriptChange() {
+  const sid = Number($("#portScript").value);
+  const entrySel = $("#portEntry");
+  if (!sid) { entrySel.innerHTML = ""; $("#portSummary").innerHTML = ""; return; }
+  let src = portState.docs.get(sid);
+  if (!src) {
+    try {
+      src = await api(`/api/scripts/${sid}`);
+    } catch (err) {
+      toast("来源脚本加载失败：" + err.message, 3000);
+      return;
+    }
+    portState.docs.set(sid, src);
+  }
+  if (!(src.content?.nodes || []).length) {
+    entrySel.disabled = true;
+    entrySel.innerHTML = `<option value="">（来源脚本没有节点）</option>`;
+    $("#portConfirm").disabled = true;
+    $("#portSummary").innerHTML = "";
+    return;
+  }
+  entrySel.disabled = false;
+  $("#portConfirm").disabled = false;
+  entrySel.innerHTML = src.content.nodes.map((n) =>
+    `<option value="${esc(n.id)}">${esc(n.title || "(未命名节点)")}（${esc(n.id)}）${
+      n.id === src.content.start_node_id ? " · 起始" : ""}</option>`).join("");
+  const start = src.content.start_node_id;
+  if (start && src.content.nodes.some((n) => n.id === start)) entrySel.value = start;
+  updatePortSummary();
+}
+
+function updatePortSummary() {
+  const el = $("#portSummary");
+  const sid = Number($("#portScript").value);
+  const entryId = $("#portEntry").value;
+  const src = portState.docs.get(sid);
+  if (!src) { el.innerHTML = ""; return; }
+  if (!entryId) {
+    el.innerHTML = `<span class="port-warn">来源脚本没有任何节点，无法移植。</span>`;
+    return;
+  }
+  const s = portSubgraphSummary(reachableSubgraph(src.content, entryId));
+  el.innerHTML =
+    `将复制 <b>${s.nodes}</b> 个节点、<b>${s.internal}</b> 条内部选项连接` +
+    (s.dangling ? `，<b class="port-warn">${s.dangling}</b> 个选项无内部目标（仍保持未连接）` : "") +
+    `。<br>节点与选项都会重新生成 ID，内部跳转引用统一重写；按原相对坐标放在当前视野附近，当前起始节点不变。`;
+}
+
+async function confirmPort() {
+  const sid = Number($("#portScript").value);
+  const entryId = $("#portEntry").value;
+  if (!sid || !entryId) return;
+  let src = portState.docs.get(sid);
+  if (!src) {
+    try { src = await api(`/api/scripts/${sid}`); }
+    catch (err) { toast("来源脚本加载失败：" + err.message, 3000); return; }
+  }
+  const order = reachableSubgraph(src.content, entryId);
+  if (!order.length) { toast("入口节点不存在，无法移植", 3000); return; }
+
+  // Fresh ids must avoid both existing canvas ids and each other.
+  const taken = new Set(state.doc.content.nodes.map((n) => n.id));
+  const mint = (prefix) => {
+    let id;
+    do { id = uid(prefix); } while (taken.has(id));
+    taken.add(id);
+    return id;
+  };
+  const nodeIdMap = new Map();
+  order.forEach((n) => nodeIdMap.set(n.id, mint("n")));
+
+  // Translate the copied group so its bbox is centered at the current
+  // viewport center (world coords), keeping original relative coordinates.
+  const rect = $("#canvasWrap").getBoundingClientRect();
+  const viewCx = rect.width / 2 - state.pan.x;
+  const viewCy = rect.height / 2 - state.pan.y;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  order.forEach((n) => {
+    const x = Number(n.x) || 0, y = Number(n.y) || 0;
+    minX = Math.min(minX, x); minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+  });
+  const NODE_W = 230, NODE_H_EST = 150, MARGIN = 20;
+  let offX = viewCx - ((minX + maxX) / 2 + NODE_W / 2);
+  let offY = viewCy - ((minY + maxY) / 2 + 40);
+  // keep the translated group inside the world bounds
+  const loX = MARGIN - minX, hiX = WORLD_W - MARGIN - NODE_W - maxX;
+  const loY = MARGIN - minY, hiY = WORLD_H - MARGIN - NODE_H_EST - maxY;
+  offX = loX <= hiX ? Math.min(Math.max(offX, loX), hiX) : loX;
+  offY = loY <= hiY ? Math.min(Math.max(offY, loY), hiY) : loY;
+
+  const newNodes = order.map((n) => ({
+    id: nodeIdMap.get(n.id),
+    type: n.type === "info" ? "info" : "question",
+    title: n.title || "",
+    text: n.text || "",
+    terminal: !!n.terminal,
+    x: (Number(n.x) || 0) + offX,
+    y: (Number(n.y) || 0) + offY,
+    options: (n.options || []).map((o) => ({
+      id: mint("o"),
+      label: o.label || "",
+      // only internal targets inside the copied subgraph are rewritten;
+      // empty/missing/outside targets stay unconnected
+      target_id: o.target_id && nodeIdMap.has(o.target_id) ? nodeIdMap.get(o.target_id) : null,
+    })),
+  }));
+
+  state.doc.content.nodes.push(...newNodes);
+  state.selectedNodeId = nodeIdMap.get(entryId);
+  state.selectedEdge = null;
+  closeModal("portModal");
+  changed();            // one history entry => the whole port is a single undo
+  validateLocal();      // refresh structure markers immediately
+  toast(`已移植 ${newNodes.length} 个节点、${
+    portSubgraphSummary(order).internal} 条内部连接`);
 }
 
 // ---------------------------------------------------------------- share / preview
